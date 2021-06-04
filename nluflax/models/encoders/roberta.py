@@ -66,13 +66,6 @@ class RoBERTaEmbeddings(nn.Module):
         return embeddings
 
 
-class BertSelfOutput(nn.Module):
-    @nn.compact
-    def __call__(self, hidden_states, input_tensor, deterministic=True):
-        hidden_states = nn.Dense(self.config.hidden_size)(hidden_states)
-        return hidden_states
-
-
 class BertAttention(nn.Module):
     config: RoBERTaConfig
 

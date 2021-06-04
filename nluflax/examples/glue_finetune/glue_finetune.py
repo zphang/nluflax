@@ -1,19 +1,80 @@
+from typing import Any
+import math
+import numpy as np
+import os
+import tqdm.auto as tqdm
+import urllib
+from dataclasses import dataclass
+from sklearn.metrics import f1_score, matthews_corrcoef
+from scipy.stats import pearsonr, spearmanr
+
+import jax
+import jax.numpy as jnp
+import flax
 from flax import linen as nn
 from flax.core import FrozenDict, freeze, unfreeze
 from flax import traverse_util
 from flax.training import train_state
-import jax
-import jax.numpy as jnp
-import numpy as np
 import optax
-from jax.lib import xla_bridge
 import torch
-import datasets
-from typing import Any
-import tqdm.auto as tqdm
-import math
-from dataclasses import dataclass
 import transformers
+import datasets
+from absl import flags, app
+
+
+FLAGS = flags.FLAGS
+flags.DEFINE_float(
+    'learning_rate',
+    default=1e-5, help='The learning rate for the AdamW optimizer.',
+)
+flags.DEFINE_integer(
+    'batch_size',
+    default=16, help='Batch size for training.',
+)
+flags.DEFINE_integer(
+    'max_seq_length',
+    default=256, help='Maximum sequence length',
+)
+flags.DEFINE_integer(
+    'num_epochs',
+    default=5, help='Number of train epochs.',
+)
+flags.DEFINE_string(
+    'model_name',
+    default="roberta-base", help='"roberta-base" or "roberta-large"',
+)
+flags.DEFINE_string(
+    'task',
+    default=None, help='cola/mnli/mrpc/qnli/qqp/rte/sst/stsb/wnli',
+)
+flags.DEFINE_string(
+    'output_dir',
+    default=None, help='Directory to output to',
+)
+
+
+NUM_LABELS_DICT = {
+    "cola": 2,
+    "mnli": 3,
+    "mrpc": 2,
+    "qnli": 2,
+    "qqp": 2,
+    "rte": 2,
+    "sst": 2,
+    "stsb": 1,
+    "wnli": 2,
+}
+INPUT_FIELDS_DICT = {
+    "cola": ["sentence"],
+    "mnli": ["premise", "hypothesis"],
+    "mrpc": ["sentence1", "sentence2"],
+    "qnli": ["question", "sentence"],
+    "qqp": ["sentence1", "sentence2"],
+    "rte": ["sentence1", "sentence2"],
+    "sst": ["sentence"],
+    "stsb": ["sentence1", "sentence2"],
+    "wnli": ["sentence1", "sentence2"],
+}
 
 
 @dataclass
@@ -25,9 +86,10 @@ class RoBERTaConfig:
     ln_eps: float = 1e-5
     dropout_rate: float = 0.5
     attention_dropout_rate: float = 0.5
+    dtype: Any = jnp.float32
 
     # Depends on model-type
-    hidden_size = 768
+    hidden_size: int = 768
     intermediate_size: int = 3072
     num_layers: int = 12
     num_heads: int = 12
@@ -35,7 +97,29 @@ class RoBERTaConfig:
 
     # Run-dependent
     max_seq_length: int = 256
-    dtype: Any = jnp.float32
+
+    @classmethod
+    def from_model_name(cls, model_name, max_seq_length):
+        if model_name == "roberta-base":
+            return cls(
+                hidden_size=768,
+                intermediate_size=3072,
+                num_layers=12,
+                num_heads=12,
+                head_size=64,
+                max_seq_length=max_seq_length,
+            )
+        elif model_name == "roberta-large":
+            return cls(
+                hidden_size=1024,
+                intermediate_size=4096,
+                num_layers=24,
+                num_heads=16,
+                head_size=64,
+                max_seq_length=max_seq_length,
+            )
+        else:
+            raise KeyError(model_name)
 
 
 class RoBERTaEmbeddings(nn.Module):
@@ -234,11 +318,25 @@ def cross_entropy_loss(logits, labels):
     log_probs = nn.log_softmax(logits)
     return -jnp.mean(jnp.sum(onehot(labels, num_classes=log_probs.shape[-1]) * log_probs, axis=-1))
 
+
 def from_frozen(params):
     return {'/'.join(k): v for k, v in traverse_util.flatten_dict(params).items()}
 
+
 def to_frozen(flat_params):
     return FrozenDict(traverse_util.unflatten_dict({tuple(k.split('/')): v for k, v in flat_params.items()}))
+
+
+def learning_rate_scheduler(lr, total_steps):
+    def f(step):
+        return lr * (total_steps - step) / total_steps
+    return f
+
+
+def save_params(params, path):
+    with open(path, "wb") as f:
+        f.write(flax.serialization.to_bytes(params))
+
 
 def load_params_from_pt_weights(pt_weights_path, config):
     weights = {k: v.numpy() for k, v in torch.load(pt_weights_path).items()}
@@ -270,6 +368,7 @@ def load_params_from_pt_weights(pt_weights_path, config):
     loaded_params = jax.device_put(to_frozen(loaded_params))
     return loaded_params
 
+
 def insert_roberta_params(params, roberta_params):
     params = unfreeze(params)
     params["roberta"] = roberta_params
@@ -277,142 +376,248 @@ def insert_roberta_params(params, roberta_params):
     return params
 
 
-def learning_rate_scheduler(lr, total_steps):
-    def f(step):
-        return lr * (total_steps - step) / total_steps
-    return f
+def prepare_dataset(model_name, task, max_seq_length):
+    task_dataset = datasets.load_dataset("glue", name=task)
+    tokenizer = transformers.RobertaTokenizer.from_pretrained(model_name)
+
+    def tokenize_examples(examples: dict):
+        return tokenizer(
+            *[examples[field] for field in INPUT_FIELDS_DICT[task]],
+            padding="max_length",
+            max_length=max_seq_length,
+            truncation="longest_first",
+        )
+    tokenized_dataset = task_dataset.map(tokenize_examples, batched=True)
+    if task == "mnli":
+        return {
+            "train": tokenized_dataset["train"],
+            "validation": tokenized_dataset["validation_matched"],
+        }
+    else:
+        return {
+            "train": tokenized_dataset["train"],
+            "validation": tokenized_dataset["validation"],
+        }
 
 
-def compute_metrics(logits, labels):
-    loss = cross_entropy_loss(logits, labels)
-    accuracy = jnp.mean(jnp.argmax(logits, -1) == labels)
-    metrics = {
-        'loss': loss,
-        'accuracy': accuracy,
-        #'logits': logits,
-    }
-    return metrics
-
-
-def convert_batch(raw_batch):
-    return {
+def convert_batch(raw_batch, reshape_for_devices=True):
+    batch_size = len(raw_batch["input_ids"][0])
+    local_device_count = jax.local_device_count()
+    full_batch =  {
         "input_ids": np.array(raw_batch["input_ids"]),
         "attention_mask": np.array(raw_batch["attention_mask"]),
         "label": np.array(raw_batch["label"]),
     }
+    if reshape_for_devices:
+        batch = {
+            k: v.reshape((local_device_count, -1) + v.shape[1:])
+            for k, v in full_batch.items()
+        }
+        return batch
+    else:
+        return full_batch
 
 
-def main():
-    task_dataset = datasets.load_dataset("glue", name="rte")
-    tokenizer = transformers.RobertaTokenizer.from_pretrained("roberta-base")
-    max_seq_length = 256
-    config = RoBERTaConfig(max_seq_length=max_seq_length)
-    batch_size = 16
-    learning_rate = 1e-5
-    num_epochs = 10
+def compute_batch_metrics(logits, labels, task):
+    if task in ["qnli", "mnli", "rte", "sst", "wnli"]:
+        metrics = score_task(logits, labels, task)
+    else:
+        # The other metrics aren't jax-friendly
+        metrics = {}
+    metrics["loss"] = cross_entropy_loss(logits, labels)
+    return metrics
 
-    def tokenize_examples(examples: dict):
-        if "sentence1" in examples:
-            return tokenizer.batch_encode_plus(
-                list(zip(examples["sentence1"], examples["sentence2"])),
-                padding="max_length",
-                max_length=max_seq_length,
-                truncation="longest_first",
-            )
-        else:
-            return tokenizer.batch_encode_plus(
-                examples["sentence"],
-                padding="max_length",
-                max_length=max_seq_length,
-                truncation="longest_first",
-            )
 
-    @jax.jit
-    def train_step(state, batch):
-        def loss_fn(params):
-            logits = task_model.apply(
-                {"params": params},
-                batch["input_ids"],
-                batch["attention_mask"],
-                False,
-            )
-            loss = cross_entropy_loss(logits, batch["label"])
-            return loss, logits
+def score_task(logits, labels, task):
+    if task in ["qnli", "mnli", "rte", "sst", "wnli"]:
+        preds = logits.argmax(-1)
+        return {
+            "accuracy": (preds == labels).mean(),
+        }
+    elif task == "stsb":
+        preds = logits[:, -1]
+        pearson_corr = pearsonr(preds, labels)[0]
+        spearman_corr = spearmanr(preds, labels)[0]
+        return {
+            "pearson": pearson_corr,
+            "spearmanr": spearman_corr,
+            "corr": (pearson_corr + spearman_corr) / 2,
+        }
+    elif task in ["mrpc", "qqp"]:
+        preds = logits.argmax(-1)
+        acc = (preds == labels).mean()
+        labels = np.array(labels)
+        f1 = f1_score(y_true=labels, y_pred=preds)
+        return {
+            "acc": acc,
+            "f1": f1,
+            "acc_and_f1": (acc + f1) / 2,
+        }
+    elif task == "cola":
+        preds = logits.argmax(-1)
+        return {
+            "mcc": matthews_corrcoef(labels, preds),
+        }
+    elif task == "sst":
+        return
+    else:
+        raise KeyError(task)
 
-        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-        (_, logits), grads = grad_fn(state.params)
-        state = state.apply_gradients(grads=grads)
-        metrics = compute_metrics(logits, batch['label'])
-        return state, metrics
 
-    @jax.jit
-    def eval_step(params, batch):
-        logits = task_model.apply(
+def train_step(state, batch, task):
+    def loss_fn(params):
+        logits_ = state.apply_fn(
             {"params": params},
             batch["input_ids"],
             batch["attention_mask"],
-            True,
+            False,
         )
-        return logits
+        if task == "stsb":
+            loss = ((logits_[:, 0] - batch["label"]) ** 2).mean()
+        else:
+            loss = cross_entropy_loss(logits_, batch["label"])
+        return loss, logits_
 
-    def train_epoch(state, train_ds):
-        batch_metrics = []
-        num_examples = len(train_ds)
-        permuted_idx = np.random.permutation(num_examples)
-        for i in tqdm.trange(0, num_examples, batch_size):
-            batch_idx = permuted_idx[i:i+batch_size]
-            batch = convert_batch(train_ds[batch_idx])
-            state, metrics = train_step(state, batch)
-            batch_metrics.append(metrics)
-        batch_metrics_np = jax.device_get(batch_metrics)
-        epoch_metrics_np = {
-            k: np.mean([metrics[k] for metrics in batch_metrics_np])
-            for k in batch_metrics_np[0]
-        }
-        return state, epoch_metrics_np
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (_, logits), grads = grad_fn(state.params)
+    grads = jax.lax.pmean(grads, 'batch')
+    state = state.apply_gradients(grads=grads)
+    metrics = compute_batch_metrics(logits, batch['label'], task=task)
+    return state, metrics
 
-    def eval_model(params, validation_ds, batch_size):
-        num_examples = len(validation_ds)
-        all_preds = []
-        eval_batch_size = batch_size * 2
-        for i in tqdm.trange(0, num_examples, eval_batch_size):
-            batch = convert_batch(validation_ds[i:i+eval_batch_size])
-            preds = jax.device_get(eval_step(params, batch))
-            all_preds.append(preds)
-        all_preds = np.concatenate(all_preds, axis=0)
-        return all_preds
 
-    tokenized_dataset = task_dataset.map(tokenize_examples, batched=True)
-    roberta_params = load_params_from_pt_weights(
-        "/home/zp489/scratch/working/2105/28_flax/exp3/v1/pytorch_model.bin",
-        config=RoBERTaConfig,
+def eval_step(state, batch):
+    logits = state.apply_fn(
+        {"params": state.params},
+        batch["input_ids"],
+        batch["attention_mask"],
+        True,
     )
-    total_steps = num_epochs * math.ceil(len(tokenized_dataset["train"]) / batch_size)
-    rng = jax.random.PRNGKey(3)
+    return logits
+
+
+multi_device_train_step = jax.pmap(train_step, axis_name="batch", static_broadcasted_argnums=(2,))
+multi_device_eval_step = jax.pmap(eval_step, axis_name="batch")
+single_device_eval_step = jax.jit(eval_step)
+
+
+def train_epoch(state, train_ds, task, batch_size):
+    batch_metrics = []
+    num_examples = len(train_ds)
+    # Skip the last batch. Too annoying to deal with :/
+    num_used_examples = num_examples // batch_size * batch_size
+    permuted_idx = np.random.permutation(num_examples)[:num_used_examples]
+    for i in tqdm.trange(0, num_used_examples, batch_size):
+        batch_idx = permuted_idx[i:i + batch_size]
+        batch = convert_batch(train_ds[batch_idx])
+        state, metrics = multi_device_train_step(state, batch, task)
+        batch_metrics.append(metrics)
+    batch_metrics_np = jax.device_get(batch_metrics)
+    epoch_metrics_np = {
+        k: np.mean([metrics[k] for metrics in batch_metrics_np])
+        for k in batch_metrics_np[0]
+    }
+    return state, epoch_metrics_np
+
+
+def eval_model(state, validation_ds, task, eval_batch_size):
+    num_examples = len(validation_ds)
+    all_logits = []
+    for i in tqdm.trange(0, num_examples, eval_batch_size):
+        raw_batch = validation_ds[i:i + eval_batch_size]
+        if len(raw_batch["input_ids"]) == eval_batch_size:
+            # Regular batch
+            batch = convert_batch(raw_batch)
+            logits = jax.device_get(multi_device_eval_step(state, batch))
+            logits = logits.reshape(-1, logits.shape[-1])
+        else:
+            # Special handling for last batch.
+            # I guess we'll just loop over it?
+            # If we really wanted to be efficient, we could do some of this last
+            # batch across all devices first.
+            local_device_count = jax.local_device_count()
+            capacity_per_device = eval_batch_size // local_device_count
+            sub_logits_ls = []
+            for j in range(0, len(raw_batch["input_ids"]), capacity_per_device):
+                single_device_state = jax_utils.unreplicate(state)
+                raw_sub_batch = validation_ds[i + j: i + j + capacity_per_device]
+                sub_batch = convert_batch(
+                    raw_sub_batch,
+                    reshape_for_devices=False,
+                )
+                sub_logits = jax.device_get(
+                    single_device_eval_step(single_device_state, sub_batch)
+                )
+                sub_logits_ls.append(sub_logits)
+            logits = np.concatenate(sub_logits_ls, axis=0)
+
+        all_logits.append(logits)
+    all_logits = np.concatenate(all_logits, axis=0)
+    all_labels = np.array(validation_ds["label"])
+    return score_task(all_logits, all_labels, task)
+
+
+def main(_):
+    cfg = FLAGS
+    os.makedirs(cfg.output_dir, exist_ok=True)
+    model_config = RoBERTaConfig.from_model_name(cfg.model_name, max_seq_length=cfg.max_seq_length)
+
+    # Prepare the dataset
+    tokenized_dataset = prepare_dataset(
+        model_name=cfg.model_name,
+        task=cfg.task,
+        max_seq_length=cfg.max_seq_length,
+    )
+
+    # Create our model
+    rng = jax.random.PRNGKey(0)
     rng, init_rng = jax.random.split(rng)
     task_model = RoBERTaClassificationModel(
-        config=config,
-        num_labels=2,
+        config=model_config,
+        num_labels=NUM_LABELS_DICT[cfg.task],
     )
-    dummy_input_ids = jnp.ones([1, max_seq_length]).astype(jnp.int32)
-    dummy_mask = jnp.ones([1, max_seq_length])#.astype(jnp.int32)
+
+    # Create dummy inputs to help initialize parameters
+    dummy_input_ids = jnp.ones([1, cfg.max_seq_length]).astype(jnp.int32)
+    dummy_mask = jnp.ones([1, cfg.max_seq_length])
     params = task_model.init(init_rng, dummy_input_ids, dummy_mask)['params']
+
     # Insert pretrained RoBERTa encoder params
+    urllib.request.urlretrieve(
+        f"https://huggingface.co/{cfg.model_name}/resolve/main/pytorch_model.bin",
+        os.path.join(cfg.output_dir, f"{cfg.model_name}.p"),
+    )
+    roberta_params = load_params_from_pt_weights(
+        os.path.join(cfg.output_dir, f"{cfg.model_name}.p"),
+        config=model_config,
+    )
     params = insert_roberta_params(params, roberta_params)
-    tx = optax.adamw(
-        learning_rate_scheduler(learning_rate, total_steps=total_steps)
-        #learning_rate
-    )
-    state = train_state.TrainState.create(
-      apply_fn=task_model.apply, params=params, tx=tx,
-    )
+
+    # Set up our optimizer and training state
+    total_steps = cfg.num_epochs * math.ceil(len(tokenized_dataset["train"]) / cfg.batch_size)
+    tx = optax.adamw(learning_rate_scheduler(cfg.learning_rate, total_steps=total_steps))
+    state = train_state.TrainState.create(apply_fn=task_model.apply, params=params, tx=tx)
+
+    # Start training
     epoch_metrics = []
-    for epoch_i in tqdm.trange(num_epochs):
-        state, metrics = train_epoch(state=state, train_ds=tokenized_dataset["train"])
-        epoch_metrics.append(metrics)
-        all_preds = eval_model(state.params, tokenized_dataset["validation"])
-        print(metrics)
-        print(
-            epoch_i,
-            (all_preds.argmax(-1) == np.array(tokenized_dataset["validation"]["label"])).mean()
+    for epoch_i in tqdm.trange(cfg.num_epochs):
+        state, metrics = train_epoch(
+            state=state,
+            train_ds=tokenized_dataset["train"],
+            task=cfg.task,
+            batch_size=cfg.batch_size,
         )
+        epoch_metrics.append(metrics)
+        eval_metrics = eval_model(
+            state=state,
+            validation_ds=tokenized_dataset["validation"],
+            task=cfg.task,
+            eval_batch_size=cfg.batch_size * 2,
+        )
+        print(f"Epoch {epoch_i}", eval_metrics)
+        save_params(params, os.path.join(cfg.outdir_dir, f"model__epoch{epoch_i}.params"))
+
+
+if __name__ == '__main__':
+    flags.mark_flags_as_required(['task', 'output_dir'])
+    app.run(main)
